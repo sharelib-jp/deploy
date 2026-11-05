@@ -1,0 +1,130 @@
+name: sharelib
+
+x-auth-image: &auth-image
+  image: ${AUTH_IMAGE:-ghcr.io/sharelib-jp/auth-service:latest}
+  build:
+    context: ../auth-service
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 prepare.py first}
+      AUTH_POSTGRES_DB: ${AUTH_POSTGRES_DB:-auth}
+      AUTH_POSTGRES_USER: ${AUTH_POSTGRES_USER:-auth}
+      AUTH_POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD:?Run python3 prepare.py first}
+      REPOSITORY_POSTGRES_DB: ${REPOSITORY_POSTGRES_DB:-repository}
+      REPOSITORY_POSTGRES_USER: ${REPOSITORY_POSTGRES_USER:-repository}
+      REPOSITORY_POSTGRES_PASSWORD: ${REPOSITORY_POSTGRES_PASSWORD:?Run python3 prepare.py first}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - type: bind
+        source: ./postgres/init-databases.sh
+        target: /docker-entrypoint-initdb.d/10-sharelib.sh
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      # TCP is available after the image has finished running its init scripts.
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  auth-keygen:
+    <<: *auth-image
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        umask 077
+        if [ ! -s /app/keys/oidc-signing.pem ]; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /app/keys/oidc-signing.pem.tmp
+          mv /app/keys/oidc-signing.pem.tmp /app/keys/oidc-signing.pem
+        fi
+    volumes:
+      - auth_keys:/app/keys
+    restart: "no"
+
+  auth:
+    <<: *auth-image
+    environment:
+      OAUTH_HMAC_SECRET: ${OAUTH_HMAC_SECRET:?Run python3 prepare.py first}
+      OAUTH_CLIENT_SECRET: ${REPOSITORY_OIDC_CLIENT_SECRET:?Run python3 prepare.py first}
+    volumes:
+      - type: bind
+        source: ./runtime/auth/config.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - auth_keys:/app/keys:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-keygen:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8080/.well-known/nodeinfo]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  repository:
+    image: ${REPOSITORY_IMAGE:-ghcr.io/sharelib-jp/repository-service:latest}
+    build:
+      context: ../repository-service
+    environment:
+      REPOSITORY_OIDC_CLIENT_SECRET: ${REPOSITORY_OIDC_CLIENT_SECRET:?Run python3 prepare.py first}
+    volumes:
+      - type: bind
+        source: ./runtime/repository/config.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8081/.well-known/nodeinfo]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  gateway:
+    image: caddy:2-alpine
+    environment:
+      AUTH_DOMAIN: ${AUTH_DOMAIN:?Set AUTH_DOMAIN in .env}
+      REPOSITORY_DOMAIN: ${REPOSITORY_DOMAIN:?Set REPOSITORY_DOMAIN in .env}
+    ports: ['80:80', '443:443']
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      default:
+        aliases:
+          - ${AUTH_DOMAIN}
+          - ${REPOSITORY_DOMAIN}
+    depends_on:
+      auth: {condition: service_healthy}
+      repository: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  auth_keys:
+  caddy_data:
+  caddy_config:

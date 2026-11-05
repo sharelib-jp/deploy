@@ -1,0 +1,7 @@
+{$AUTH_DOMAIN} {
+    reverse_proxy auth:8080
+}
+
+{$REPOSITORY_DOMAIN} {
+    reverse_proxy repository:8081
+}

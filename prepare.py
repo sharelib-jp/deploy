@@ -45,7 +45,8 @@ def load_env():
     values = read_env(example) | read_env(text)
     additions = {}
     for name in ['POSTGRES_PASSWORD', 'AUTH_POSTGRES_PASSWORD', 'REPOSITORY_POSTGRES_PASSWORD',
-                 'OAUTH_HMAC_SECRET', 'REPOSITORY_OIDC_CLIENT_SECRET', 'CATALOG_API_TOKEN']:
+                 'OAUTH_HMAC_SECRET', 'REPOSITORY_OIDC_CLIENT_SECRET', 'CATALOG_API_TOKEN',
+                 'PGADMIN_DEFAULT_PASSWORD']:
         if not os.environ.get(name, values.get(name)):
             additions[name] = secrets.token_urlsafe(32)
     # Keep comments, quoted secrets and existing values intact on subsequent runs.
@@ -134,6 +135,21 @@ def repository_base_url(env, native):
     if not valid:
         raise ValueError('MAIN_REPOSITORY_BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment')
     return value.rstrip('/')
+
+
+def pgadmin_servers(env):
+    # Connection definitions contain no passwords. pgAdmin prompts on connection.
+    servers = {}
+    for index, (name, database, user) in enumerate([
+            ('Sharelib PostgreSQL (admin)', 'postgres', 'postgres'),
+            ('Sharelib auth', env['AUTH_POSTGRES_DB'], env['AUTH_POSTGRES_USER']),
+            ('Sharelib repository', env['REPOSITORY_POSTGRES_DB'], env['REPOSITORY_POSTGRES_USER']),
+    ], start=1):
+        servers[str(index)] = {
+            'Name': name, 'Group': 'Sharelib', 'Host': 'postgres', 'Port': 5432,
+            'MaintenanceDB': database, 'Username': user, 'SSLMode': 'prefer',
+        }
+    return {'Servers': servers}
 
 
 def main():
@@ -233,7 +249,12 @@ def main():
     client_file = runtime / 'client.json'
     client_file.write_text(json.dumps(client, ensure_ascii=False) + '\n')
     client_file.chmod(0o600)
-    print('Created runtime/{auth,repository,main}/config.toml, runtime/client.json; existing config.toml files are unchanged.')
+    pgadmin_folder = runtime / 'pgadmin'
+    pgadmin_folder.mkdir(exist_ok=True)
+    server_file = pgadmin_folder / 'servers.json'
+    server_file.write_text(json.dumps(pgadmin_servers(env), ensure_ascii=False, indent=2) + '\n')
+    server_file.chmod(0o644)
+    print('Created runtime/{auth,repository,main}/config.toml, runtime/client.json and runtime/pgadmin/servers.json; existing config.toml files are unchanged.')
 
 if __name__ == '__main__':
     try:

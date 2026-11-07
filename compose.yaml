@@ -8,6 +8,7 @@ x-auth-image: &auth-image
 services:
   postgres:
     image: postgres:17-bookworm
+    networks: [database]
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
@@ -36,6 +37,7 @@ services:
 
   auth-keygen:
     <<: *auth-image
+    networks: [app]
     entrypoint: [/bin/sh, -ec]
     command:
       - |
@@ -50,6 +52,7 @@ services:
 
   auth:
     <<: *auth-image
+    networks: [app, database]
     volumes:
       - type: bind
         source: ./runtime/auth/config.toml
@@ -71,6 +74,7 @@ services:
     restart: unless-stopped
 
   repository:
+    networks: [app, database]
     image: ${REPOSITORY_IMAGE:-ghcr.io/sharelib-jp/repository-service:latest}
     build:
       context: ../repository-service
@@ -94,6 +98,7 @@ services:
     restart: unless-stopped
 
   main:
+    networks: [app]
     image: ${MAIN_IMAGE:-ghcr.io/sharelib-jp/main-service:latest}
     build:
       context: ../main-service
@@ -136,7 +141,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      default:
+      app:
         aliases:
           - ${AUTH_DOMAIN}
           - ${REPOSITORY_DOMAIN}
@@ -147,9 +152,53 @@ services:
       main: {condition: service_healthy}
     restart: unless-stopped
 
+  cloudflared:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    profiles: [tunnel]
+    command: [tunnel, --no-autoupdate, run]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks: [app]
+    depends_on:
+      gateway: {condition: service_started}
+    restart: unless-stopped
+
+  pgadmin:
+    image: ${PGADMIN_IMAGE:-dpage/pgadmin4:9.19}
+    profiles: [admin]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-}
+      PGADMIN_DISABLE_POSTFIX: 'true'
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+    ports:
+      - '${PGADMIN_BIND_ADDRESS:-127.0.0.1}:${PGADMIN_PORT:-5050}:80'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - type: bind
+        source: ./runtime/pgadmin/servers.json
+        target: /pgadmin4/servers.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [app, database]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: unless-stopped
+
+networks:
+  # Service-name traffic stays on this bridge; external catalog APIs remain reachable.
+  app:
+    driver: bridge
+  # PostgreSQL has no public ports or external network connection.
+  database:
+    driver: bridge
+    internal: true
+
 volumes:
   postgres_data:
   auth_keys:
   caddy_data:
   caddy_config:
   main_catalog:
+  pgadmin_data:

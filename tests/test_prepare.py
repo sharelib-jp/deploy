@@ -147,7 +147,7 @@ AUDIENCE = "https://repository.library.test/api"
         self.assertEqual((self.root / '.env').stat().st_mode & 0o777, 0o600)
         values = prepare.read_env(env)
         self.assertEqual(len(base64.urlsafe_b64decode(values['OAUTH_HMAC_SECRET'] + '=')), 32)
-        self.assertEqual(len({values[key] for key in values if key.endswith('PASSWORD')}), 3)
+        self.assertEqual(len({values[key] for key in values if key.endswith('PASSWORD')}), 4)
         for name, config in configs.items():
             self.assertEqual(self.config(name), config)
             self.assertEqual(config['DATABASE']['DATABASE_DRIVER'], 'sqlite')
@@ -209,6 +209,36 @@ AUDIENCE = "https://repository.library.test/api"
         with self.assertRaisesRegex(ValueError, 'must match'):
             self.run_prepare()
         self.assertEqual(self.config('main')['REPOSITORY']['TOKEN'], token)
+
+    def test_pgadmin_server_definitions_match_private_database_settings(self):
+        (self.root / '.env').write_text('AUTH_POSTGRES_DB=custom_auth\nAUTH_POSTGRES_USER=auth_owner\n')
+        self.run_prepare()
+        server_file = self.root / 'runtime/pgadmin/servers.json'
+        data = json.loads(server_file.read_text())
+        servers = list(data['Servers'].values())
+        self.assertEqual(len(servers), 3)
+        self.assertEqual({(server['MaintenanceDB'], server['Username']) for server in servers},
+                         {('postgres', 'postgres'), ('custom_auth', 'auth_owner'), ('repository', 'repository')})
+        for server in servers:
+            self.assertEqual(server['Host'], 'postgres')
+            self.assertEqual(server['Port'], 5432)
+            self.assertNotIn('Password', server)
+            self.assertNotIn('PassFile', server)
+        values = prepare.read_env((self.root / '.env').read_text())
+        for name in ['POSTGRES_PASSWORD', 'AUTH_POSTGRES_PASSWORD',
+                     'REPOSITORY_POSTGRES_PASSWORD', 'PGADMIN_DEFAULT_PASSWORD']:
+            self.assertNotIn(values[name], server_file.read_text())
+        self.assertGreaterEqual(len(values['PGADMIN_DEFAULT_PASSWORD']), 32)
+        self.assertEqual(server_file.stat().st_mode & 0o777, 0o644)
+
+    def test_pgadmin_login_password_is_preserved(self):
+        password = 'existing pgadmin password #$value'
+        (self.root / '.env').write_text("PGADMIN_DEFAULT_PASSWORD='" + password + "'\n")
+        self.run_prepare()
+        before = (self.root / '.env').read_text()
+        self.run_prepare()
+        self.assertEqual((self.root / '.env').read_text(), before)
+        self.assertEqual(prepare.read_env(before)['PGADMIN_DEFAULT_PASSWORD'], password)
 
     def test_main_repository_origin_can_be_overridden_without_changing_public_origins(self):
         (self.root / '.env').write_text('MAIN_REPOSITORY_BASE_URL=http://unused:9999\n')

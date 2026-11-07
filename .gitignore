@@ -1,4 +1,5 @@
 /.env
 /runtime/
+/config/*.config.toml
 __pycache__/
 *.pyc

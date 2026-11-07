@@ -22,9 +22,10 @@ class PrepareTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.auth_source = self.root / 'auth.toml'
-        self.repo_source = self.root / 'repository.toml'
-        self.main_source = self.root / 'main.toml'
+        (self.root / 'config').mkdir()
+        self.auth_source = self.root / 'config/auth.config.toml'
+        self.repo_source = self.root / 'config/repository.config.toml'
+        self.main_source = self.root / 'config/main.config.toml'
         self.main_source.write_text('[METADATA]\nNODE_NAME = "公開図書館"\n[SSG]\nINTERVAL = "10m"\n')
         self.auth_source.write_text('''[METADATA]
 NODE_NAME = "図書館"
@@ -35,18 +36,19 @@ RP_DISPLAY_NAME = "図書館の認証"
 HEADER = "resources/custom.svg"
 [OAUTH]
 SIGNING_KEY_ID = "existing-key-id"
+HMAC_SECRET = "existing-hmac-secret"
 ''')
         self.repo_source.write_text('''[OIDC]
 ENABLED = false
+CLIENT_SECRET = "existing-client-secret"
 [EXTERNAL]
 SOURCES_FILE = "/app/connectors/custom.yaml"
 ''')
         example = (prepare.BASE / '.env.example').read_text()
         example = example.replace('auth.example.com', 'auth.library.test').replace('repository.example.com', 'repository.library.test').replace('library.example.com', 'catalog.library.test')
-        example = example.replace('../auth-service/config.example.toml', 'auth.toml')
-        example = example.replace('../repository-service/api/config.example.toml', 'repository.toml')
-        example = example.replace('../main-service/api/config.example.toml', 'main.toml')
         (self.root / '.env.example').write_text(example)
+        for source in [self.auth_source, self.repo_source, self.main_source]:
+            source.with_suffix('.example.toml').write_text(source.read_text())
         base = patch.object(prepare, 'BASE', self.root)
         base.start()
         self.addCleanup(base.stop)
@@ -81,8 +83,8 @@ SOURCES_FILE = "/app/connectors/custom.yaml"
                 self.assertEqual(unquote(dsn.password), 'p@ss:/ #$and space')
         self.assertEqual(self.config('auth')['OAUTH']['SIGNING_KEY_FILE'], '/app/keys/oidc-signing.pem')
 
-    def test_templates_are_preserved_and_not_modified(self):
-        originals = {path: path.read_bytes() for path in [self.auth_source, self.repo_source]}
+    def test_local_configs_are_preserved_and_not_modified_when_secrets_are_set(self):
+        originals = {path: path.read_bytes() for path in [self.auth_source, self.repo_source, self.main_source]}
         self.run_prepare()
         auth = self.config('auth')
         for section in ['METADATA', 'BRANDRESOURCES']:
@@ -107,7 +109,7 @@ SOURCES_FILE = "/app/connectors/custom.yaml"
                 self.assertEqual(client['id'], config['CLIENT_ID'])
                 self.assertEqual(client['audience'], [])
 
-    def test_secrets_from_templates_and_registration_match(self):
+    def test_secrets_from_local_configs_and_registration_match(self):
         self.auth_source.write_text('[OAUTH]\nHMAC_SECRET = "template-hmac"\n')
         self.repo_source.write_text('[OIDC]\nCLIENT_SECRET = "template-client-secret"\n')
         self.run_prepare()
@@ -118,11 +120,67 @@ SOURCES_FILE = "/app/connectors/custom.yaml"
         self.assertEqual(client_file.stat().st_mode & 0o777, 0o600)
 
     def test_generated_secrets_reach_configs_and_client(self):
+        self.auth_source.write_text('[OAUTH]\nHMAC_SECRET = "" # keep this comment\n')
+        self.repo_source.write_text('[OIDC]\nCLIENT_SECRET = ""\n')
         self.run_prepare()
         env = prepare.read_env((self.root / '.env').read_text())
-        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], env['OAUTH_HMAC_SECRET'])
-        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], env['REPOSITORY_OIDC_CLIENT_SECRET'])
-        self.assertEqual(json.loads((self.root / 'runtime/client.json').read_text())['secret'], env['REPOSITORY_OIDC_CLIENT_SECRET'])
+        hmac = tomllib.loads(self.auth_source.read_text())['OAUTH']['HMAC_SECRET']
+        client_secret = tomllib.loads(self.repo_source.read_text())['OIDC']['CLIENT_SECRET']
+        self.assertEqual(len(base64.urlsafe_b64decode(hmac + '=')), 32)
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], hmac)
+        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], client_secret)
+        self.assertEqual(json.loads((self.root / 'runtime/client.json').read_text())['secret'], client_secret)
+        self.assertIn('# keep this comment', self.auth_source.read_text())
+        self.assertNotIn('OAUTH_HMAC_SECRET', env)
+        self.assertNotIn('REPOSITORY_OIDC_CLIENT_SECRET', env)
+        self.assertEqual(env['CATALOG_API_TOKEN'], self.config('repository')['CATALOG']['TOKEN'])
+        originals = {source: source.read_bytes() for source in [self.auth_source, self.repo_source]}
+        self.run_prepare()
+        for source, original in originals.items():
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(source.stat().st_mode & 0o777, 0o600)
+
+    def test_first_run_uses_deploy_examples_without_sibling_repositories(self):
+        real_config = Path(__file__).resolve().parents[1] / 'config'
+        originals = {}
+        for source in [self.auth_source, self.repo_source, self.main_source]:
+            source.unlink()
+            example = source.with_suffix('.example.toml')
+            original = (real_config / example.name).read_bytes()
+            example.write_bytes(original)
+            originals[example] = original
+        self.run_prepare()
+        self.assertEqual(self.config('main')['REPOSITORY']['BASE_URL'], 'http://repository:8081')
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'],
+                         tomllib.loads(self.auth_source.read_text())['OAUTH']['HMAC_SECRET'])
+        for example, original in originals.items():
+            self.assertEqual(example.read_bytes(), original)
+        self.assertEqual(self.main_source.read_bytes(), originals[self.main_source.with_suffix('.example.toml')])
+
+    def test_generated_secrets_preserve_values_with_different_toml_syntax(self):
+        self.auth_source.write_text('NOTE = """\n[OAUTH]\n"""\n')
+        self.repo_source.write_text('OIDC = { CLIENT_SECRET = "", CLIENT_ID = "custom-client" }\n')
+        self.run_prepare()
+        auth = tomllib.loads(self.auth_source.read_text())
+        repo = tomllib.loads(self.repo_source.read_text())
+        self.assertEqual(auth['NOTE'], '[OAUTH]\n')
+        self.assertEqual(auth['OAUTH']['HMAC_SECRET'], self.config('auth')['OAUTH']['HMAC_SECRET'])
+        self.assertEqual(repo['OIDC']['CLIENT_ID'], 'custom-client')
+        self.assertEqual(repo['OIDC']['CLIENT_SECRET'], self.config('repository')['OIDC']['CLIENT_SECRET'])
+        self.assertNotIn('CATALOG', repo)
+
+    def test_legacy_secrets_are_imported_once_with_config_taking_precedence(self):
+        self.auth_source.write_text('[OAUTH]\nHMAC_SECRET = ""\n')
+        self.repo_source.write_text('[OIDC]\n')
+        (self.root / '.env').write_text('OAUTH_HMAC_SECRET=legacy-hmac\nREPOSITORY_OIDC_CLIENT_SECRET=legacy-client\n')
+        with patch.dict(os.environ, {'OAUTH_HMAC_SECRET': 'exported-hmac'}):
+            self.run_prepare()
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], 'exported-hmac')
+        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], 'legacy-client')
+        (self.root / '.env').write_text('OAUTH_HMAC_SECRET=changed-hmac\nREPOSITORY_OIDC_CLIENT_SECRET=changed-client\n')
+        self.run_prepare()
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], 'exported-hmac')
+        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], 'legacy-client')
 
     def test_custom_client_registration(self):
         self.repo_source.write_text('''[OIDC]
@@ -139,6 +197,8 @@ AUDIENCE = "https://repository.library.test/api"
         self.assertEqual(client['audience'], ['https://repository.library.test/api'])
 
     def test_secrets_and_native_key_are_stable_on_rerun(self):
+        self.auth_source.write_text('[OAUTH]\n')
+        self.repo_source.write_text('[OIDC]\n')
         self.assertEqual(self.run_prepare(native=True), 1)
         env = (self.root / '.env').read_text()
         configs = {name: self.config(name) for name in ['auth', 'repository']}
@@ -146,7 +206,7 @@ AUDIENCE = "https://repository.library.test/api"
         self.assertEqual((self.root / '.env').read_text(), env)
         self.assertEqual((self.root / '.env').stat().st_mode & 0o777, 0o600)
         values = prepare.read_env(env)
-        self.assertEqual(len(base64.urlsafe_b64decode(values['OAUTH_HMAC_SECRET'] + '=')), 32)
+        self.assertEqual(len(base64.urlsafe_b64decode(configs['auth']['OAUTH']['HMAC_SECRET'] + '=')), 32)
         self.assertEqual(len({values[key] for key in values if key.endswith('PASSWORD')}), 4)
         for name, config in configs.items():
             self.assertEqual(self.config(name), config)
@@ -172,8 +232,9 @@ AUDIENCE = "https://repository.library.test/api"
                     self.run_prepare()
                 self.assertFalse((self.root / 'runtime').exists())
 
-    def test_missing_template_fails_before_runtime_is_created(self):
+    def test_missing_config_and_example_fail_before_runtime_is_created(self):
         self.repo_source.unlink()
+        self.repo_source.with_suffix('.example.toml').unlink()
         with self.assertRaises(FileNotFoundError):
             self.run_prepare()
         self.assertFalse((self.root / 'runtime').exists())
@@ -200,7 +261,7 @@ AUDIENCE = "https://repository.library.test/api"
                 self.assertEqual((self.root / 'runtime/main/config.toml').stat().st_mode & 0o777,
                                  0o600 if native else 0o644)
 
-    def test_catalog_template_credential_is_preserved_and_conflicts_fail(self):
+    def test_catalog_config_credential_is_preserved_and_conflicts_fail(self):
         token = 'existing-catalog-token-with-more-than-32-bytes'
         self.repo_source.write_text('[CATALOG]\nTOKEN = "' + token + '"\n')
         self.run_prepare()
@@ -242,7 +303,8 @@ AUDIENCE = "https://repository.library.test/api"
 
     def test_main_repository_origin_can_be_overridden_without_changing_public_origins(self):
         (self.root / '.env').write_text('MAIN_REPOSITORY_BASE_URL=http://unused:9999\n')
-        with patch.dict(os.environ, {'MAIN_REPOSITORY_BASE_URL': 'http://private-repository:9090/'}):
+        self.main_source.write_text('[REPOSITORY]\nBASE_URL = "http://private-repository:9090/"\n')
+        with patch.dict(os.environ, {'MAIN_REPOSITORY_BASE_URL': 'http://also-unused:9999/'}):
             self.run_prepare()
         main = self.config('main')
         self.assertEqual(main['REPOSITORY']['BASE_URL'], 'http://private-repository:9090')
@@ -251,7 +313,7 @@ AUDIENCE = "https://repository.library.test/api"
         self.assertEqual(self.config('repository')['OIDC']['REDIRECT_URI'],
                          'https://repository.library.test/auth/callback')
         self.run_prepare(native=True)
-        self.assertEqual(self.config('main')['REPOSITORY']['BASE_URL'], 'http://unused:9999')
+        self.assertEqual(self.config('main')['REPOSITORY']['BASE_URL'], 'http://private-repository:9090')
         self.assertEqual(self.config('main')['WEB']['PUBLIC_ORIGIN'], 'http://localhost:8082')
 
     def test_invalid_main_repository_origins_fail_before_writing_runtime(self):
@@ -259,10 +321,10 @@ AUDIENCE = "https://repository.library.test/api"
                       'https://repository.test/path', 'http://repository:8081?x=1',
                       'http://repository:8081#fragment', 'http://repository:8081?',
                       'http://repository:8081#', 'http://repository:99999',
-                      'http://repository:0', 'http://bad host:8081']:
+                      'http://repository:0', 'http://bad host:8081', 42]:
             with self.subTest(value=value):
-                (self.root / '.env').write_text("MAIN_REPOSITORY_BASE_URL='" + value + "'\n")
-                with self.assertRaisesRegex(ValueError, 'MAIN_REPOSITORY_BASE_URL'):
+                self.main_source.write_text('[REPOSITORY]\nBASE_URL = ' + json.dumps(value) + '\n')
+                with self.assertRaisesRegex(ValueError, r'REPOSITORY\.BASE_URL'):
                     self.run_prepare()
                 self.assertFalse((self.root / 'runtime').exists())
 

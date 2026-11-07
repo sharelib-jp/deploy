@@ -1,0 +1,39 @@
+# prepare.py copies this example to repository.config.toml on first use.
+# Public origins, ports and database connections are derived from .env / --native.
+[HOST]
+SCHEME = "http://"
+HOSTNAME = "localhost"
+PORT = ":8081"
+
+[DATABASE]
+DATABASE_DRIVER = "sqlite"
+DATABASE_DSN = "repository.db?_foreign_keys=on&_busy_timeout=5000&_txlock=immediate"
+
+[OIDC]
+ENABLED = false # Local development only. Configure OIDC and API_AUTH for deployment.
+# Empty is generated and saved in repository.config.toml by prepare.py.
+CLIENT_SECRET = ""
+
+[EXTERNAL]
+# Shared by all users and all external HTTP requests, including provider details.
+MAX_CONCURRENT = 2
+# Per destination hostname, over a sliding 60-second window.
+REQUESTS_PER_MINUTE = 60
+MIN_INTERVAL = "500ms"
+# Queue waiting does not consume the per-request network timeout.
+QUEUE_TIMEOUT = "5s"
+REQUEST_TIMEOUT = "30s"
+# Complete search including provider detail requests; at least queue + request.
+SEARCH_TIMEOUT = "2m"
+# Omit SOURCES_FILE to use the embedded source definitions.
+# SOURCES_FILE = "./connectors/sources.yaml"
+
+# [API_AUTH]
+# INTROSPECTION_URL = "https://auth.example.com/api/oauth2/introspect"
+# AUDIENCE = "https://repository.example.com/api"
+# CREDENTIAL_ID = "registered-resource-credential-id"
+# SECRET = "replace-with-32-to-72-byte-resource-secret"
+
+[CATALOG]
+# Read-only credential shared with main-service; prepare.py uses .env CATALOG_API_TOKEN if omitted.
+# TOKEN = "replace-with-at-least-32-random-characters"

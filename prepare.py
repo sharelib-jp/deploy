@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build runtime settings from the services' TOML templates (Python 3.11+)."""
+"""Build runtime settings from config/*.config.toml and shared .env (Python 3.11+)."""
 import argparse
 from datetime import date, time
 import json
@@ -45,8 +45,7 @@ def load_env():
     values = read_env(example) | read_env(text)
     additions = {}
     for name in ['POSTGRES_PASSWORD', 'AUTH_POSTGRES_PASSWORD', 'REPOSITORY_POSTGRES_PASSWORD',
-                 'OAUTH_HMAC_SECRET', 'REPOSITORY_OIDC_CLIENT_SECRET', 'CATALOG_API_TOKEN',
-                 'PGADMIN_DEFAULT_PASSWORD']:
+                 'CATALOG_API_TOKEN', 'PGADMIN_DEFAULT_PASSWORD']:
         if not os.environ.get(name, values.get(name)):
             additions[name] = secrets.token_urlsafe(32)
     # Keep comments, quoted secrets and existing values intact on subsequent runs.
@@ -96,10 +95,49 @@ def render_config(config):
     return '\n'.join(lines) + '\n'
 
 
-def load_template(path):
-    source = (BASE / path).resolve()
+def load_config(name):
+    source = BASE / 'config' / f'{name}.config.toml'
+    if not source.exists():
+        example = source.with_suffix('.example.toml')
+        source.write_text(example.read_text())
+    source.chmod(0o600)
     with source.open('rb') as file:
         return tomllib.load(file)
+
+
+def ensure_config_secret(config, name, section, key, legacy_value=None):
+    values = config.setdefault(section, {})
+    if values.get(key):
+        return
+    values[key] = legacy_value or secrets.token_urlsafe(32)
+    source = BASE / 'config' / f'{name}.config.toml'
+    text = source.read_text()
+    original = tomllib.loads(text)
+    # Preserve comments and formatting for ordinary table/key declarations.
+    table = re.search(rf'(?m)^\[{section}\][ \t]*(?:#.*)?$', text)
+    assignment = f'{key} = {toml_value(values[key])}'
+    if table:
+        following_table = re.search(r'(?m)^\[', text[table.end():])
+        end = table.end() + following_table.start() if following_table else len(text)
+        body = text[table.end():end]
+        if key not in original.get(section, {}):
+            text = text[:table.end()] + '\n' + assignment + text[table.end():]
+        else:
+            body, count = re.subn(rf'''(?m)^{key}\s*=\s*(?:""|'')([ \t]*(?:#.*)?)$''',
+                                  lambda match: assignment + match[1], body, count=1)
+            text = text[:table.end()] + body + text[end:] if count else render_config(config).split('\n', 1)[1]
+    elif section not in original:
+        text = text.rstrip() + f'\n\n[{section}]\n{assignment}\n'
+    else:
+        # Quoted/dotted keys and inline tables are valid TOML too.
+        text = render_config(config).split('\n', 1)[1]
+    try:
+        matches = tomllib.loads(text) == config
+    except tomllib.TOMLDecodeError:
+        matches = False
+    if not matches:
+        text = render_config(config).split('\n', 1)[1]
+    source.write_text(text)
 
 
 def validate_env(env):
@@ -120,8 +158,8 @@ def validate_env(env):
             raise ValueError(f'AUTH_POSTGRES_{suffix} and REPOSITORY_POSTGRES_{suffix} must be different')
 
 
-def repository_base_url(env, native):
-    value = env.get('MAIN_REPOSITORY_BASE_URL') or (
+def repository_base_url(config, native):
+    value = config.get('REPOSITORY', {}).get('BASE_URL') or (
         'http://localhost:8081' if native else 'http://repository:8081')
     try:
         parsed = urlsplit(value)
@@ -130,10 +168,10 @@ def repository_base_url(env, native):
                  and parsed.path in ['', '/'] and not parsed.query and not parsed.fragment
                  and not any(c.isspace() for c in value) and '?' not in value and '#' not in value
                  and (parsed.port is None or 1 <= parsed.port <= 65535))
-    except ValueError:
+    except (AttributeError, TypeError, ValueError):
         valid = False
     if not valid:
-        raise ValueError('MAIN_REPOSITORY_BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment')
+        raise ValueError('main.config.toml REPOSITORY.BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment')
     return value.rstrip('/')
 
 
@@ -160,14 +198,10 @@ def main():
     env = load_env()
     if not args.native:
         validate_env(env)
-    configs = {
-        'auth': load_template(env['AUTH_CONFIG_TEMPLATE']),
-        'repository': load_template(env['REPOSITORY_CONFIG_TEMPLATE']),
-        'main': load_template(env['MAIN_CONFIG_TEMPLATE']),
-    }
+    configs = {name: load_config(name) for name in ['auth', 'repository', 'main']}
     if ('CLIENT_SECRET_ENV' in configs['repository'].get('OIDC', {})
             or 'SECRET_ENV' in configs['repository'].get('API_AUTH', {})):
-        raise ValueError('Replace CLIENT_SECRET_ENV and SECRET_ENV with secret values in the template TOML')
+        raise ValueError('Replace CLIENT_SECRET_ENV and SECRET_ENV with secret values in config/repository.config.toml')
     repo_token = configs['repository'].get('CATALOG', {}).get('TOKEN')
     main_token = configs['main'].get('REPOSITORY', {}).get('TOKEN')
     if repo_token and main_token and repo_token != main_token:
@@ -175,8 +209,13 @@ def main():
     catalog_token = repo_token or main_token or env['CATALOG_API_TOKEN']
     if not isinstance(catalog_token, str) or not (32 <= len(catalog_token.encode()) <= 256) or any(c.isspace() for c in catalog_token):
         raise ValueError('Catalog TOKEN must contain 32 to 256 bytes without whitespace')
+    main_repository_url = repository_base_url(configs['main'], args.native)
+    # Import existing deployment secrets once rather than rotating credentials.
+    ensure_config_secret(configs['auth'], 'auth', 'OAUTH', 'HMAC_SECRET',
+                         os.environ.get('OAUTH_HMAC_SECRET', env.get('OAUTH_HMAC_SECRET')))
+    ensure_config_secret(configs['repository'], 'repository', 'OIDC', 'CLIENT_SECRET',
+                         os.environ.get('REPOSITORY_OIDC_CLIENT_SECRET', env.get('REPOSITORY_OIDC_CLIENT_SECRET')))
     configs['repository'].setdefault('CATALOG', {})['TOKEN'] = catalog_token
-    main_repository_url = repository_base_url(env, args.native)
     runtime = (BASE / 'runtime').resolve()
     auth_origin = 'http://localhost:8080' if args.native else 'https://' + env['AUTH_DOMAIN']
     repo_origin = 'http://localhost:8081' if args.native else 'https://' + env['REPOSITORY_DOMAIN']
@@ -227,13 +266,9 @@ def main():
             oauth.update(ENABLED=True, ISSUER=auth_origin,
                          SIGNING_KEY_FILE=str(key) if args.native else '/app/keys/oidc-signing.pem')
             oauth.setdefault('SIGNING_KEY_ID', 'sharelib-1')
-            if not oauth.get('HMAC_SECRET'):
-                oauth['HMAC_SECRET'] = env['OAUTH_HMAC_SECRET']
         else:
             oidc = config.setdefault('OIDC', {})
             oidc.update(ENABLED=True, ISSUER=auth_origin, REDIRECT_URI=repo_origin + '/auth/callback')
-            if not oidc.get('CLIENT_SECRET'):
-                oidc['CLIENT_SECRET'] = env['REPOSITORY_OIDC_CLIENT_SECRET']
             oidc.setdefault('CLIENT_ID', 'repository-service')
             oidc.setdefault('SCOPES', ['openid', 'profile', 'email', 'offline_access'])
         target = folder / 'config.toml'
@@ -254,7 +289,7 @@ def main():
     server_file = pgadmin_folder / 'servers.json'
     server_file.write_text(json.dumps(pgadmin_servers(env), ensure_ascii=False, indent=2) + '\n')
     server_file.chmod(0o644)
-    print('Created runtime/{auth,repository,main}/config.toml, runtime/client.json and runtime/pgadmin/servers.json; existing config.toml files are unchanged.')
+    print('Created runtime/{auth,repository,main}/config.toml, runtime/client.json and runtime/pgadmin/servers.json from config/*.config.toml and .env.')
 
 if __name__ == '__main__':
     try:

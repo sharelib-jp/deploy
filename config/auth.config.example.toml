@@ -1,0 +1,37 @@
+# prepare.py copies this example to auth.config.toml on first use.
+# Public origins, ports and database connections are derived from .env / --native.
+[HOST]
+SCHEME = "http://"
+HOSTNAME = "auth-dev-sharelib.luca.hij1.local.sasakulab.com"
+PORT = ":8080"
+
+[WEBAUTHN]
+RP_DISPLAY_NAME = "auth-dev-sharelib.luca.hij1.local.sasakulab.com"
+RP_ORIGIN = "https://auth-dev-sharelib.luca.hij1.local.sasakulab.com"
+
+[DATABASE]
+# DATABASE_DRIVER = "sqlite"
+# DATABASE_DSN = "auth.db?_busy_timeout=5000&_foreign_keys=on&_txlock=immediate"
+DATABASE_DRIVER = "postgres"
+DATABASE_DSN = "host=localhost port=5432 user=sharelib-auth-dev-001 password=sharelib dbname=sharelib-auth-dev-001 sslmode=disable TimeZone=Asia/Tokyo"
+
+[METADATA]
+NODE_NAME = "開発図書館"
+APPLICATION_NAME = "認証・認可サーバ"
+NODE_DOMAIN = "dev-sharelib.luca.hij1.local.sasakulab.com"
+NODE_ADMINS = [{ name = "developer", email = "admin@example.com" }]
+MAINTAINER = [{ name = "developer", email = "admin@example.com" }]
+
+[BRANDRESOURCES]
+HEADER = "./resources/header.svg"
+
+[OAUTH]
+# Set an unpadded base64url-encoded random key of at least 32 bytes.
+# Empty is generated and saved in auth.config.toml by prepare.py.
+HMAC_SECRET = ""
+# HMAC_PREVIOUS_SECRETS = ["previous-base64url-key"]
+ENABLED = true
+ISSUER = "https://auth-dev-sharelib.luca.hij1.local.sasakulab.com"
+SIGNING_KEY_FILE = "./oidc-private.pem"
+SIGNING_KEY_ID = "signing-key-2026"
+# PREVIOUS_JWKS_FILE = "/secure/path/previous-public-jwks.json"

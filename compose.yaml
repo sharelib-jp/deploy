@@ -50,9 +50,6 @@ services:
 
   auth:
     <<: *auth-image
-    environment:
-      OAUTH_HMAC_SECRET: ${OAUTH_HMAC_SECRET:?Run python3 prepare.py first}
-      OAUTH_CLIENT_SECRET: ${REPOSITORY_OIDC_CLIENT_SECRET:?Run python3 prepare.py first}
     volumes:
       - type: bind
         source: ./runtime/auth/config.toml
@@ -77,8 +74,6 @@ services:
     image: ${REPOSITORY_IMAGE:-ghcr.io/sharelib-jp/repository-service:latest}
     build:
       context: ../repository-service
-    environment:
-      REPOSITORY_OIDC_CLIENT_SECRET: ${REPOSITORY_OIDC_CLIENT_SECRET:?Run python3 prepare.py first}
     volumes:
       - type: bind
         source: ./runtime/repository/config.toml
@@ -98,11 +93,37 @@ services:
       retries: 12
     restart: unless-stopped
 
+  main:
+    image: ${MAIN_IMAGE:-ghcr.io/sharelib-jp/main-service:latest}
+    build:
+      context: ../main-service
+      target: main
+    volumes:
+      - type: bind
+        source: ./runtime/main/config.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - main_catalog:/srv/main
+    depends_on:
+      repository: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8082/.well-known/nodeinfo]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   gateway:
-    image: caddy:2-alpine
+    image: ${GATEWAY_IMAGE:-sharelib-gateway:local}
+    build:
+      context: ../main-service
+      target: gateway
     environment:
       AUTH_DOMAIN: ${AUTH_DOMAIN:?Set AUTH_DOMAIN in .env}
       REPOSITORY_DOMAIN: ${REPOSITORY_DOMAIN:?Set REPOSITORY_DOMAIN in .env}
+      MAIN_DOMAIN: ${MAIN_DOMAIN:?Set MAIN_DOMAIN in .env}
     ports: ['80:80', '443:443']
     volumes:
       - type: bind
@@ -111,6 +132,7 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - main_catalog:/srv/main
       - caddy_data:/data
       - caddy_config:/config
     networks:
@@ -118,9 +140,11 @@ services:
         aliases:
           - ${AUTH_DOMAIN}
           - ${REPOSITORY_DOMAIN}
+          - ${MAIN_DOMAIN}
     depends_on:
       auth: {condition: service_healthy}
       repository: {condition: service_healthy}
+      main: {condition: service_healthy}
     restart: unless-stopped
 
 volumes:
@@ -128,3 +152,4 @@ volumes:
   auth_keys:
   caddy_data:
   caddy_config:
+  main_catalog:

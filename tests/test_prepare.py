@@ -24,6 +24,8 @@ class PrepareTest(unittest.TestCase):
         self.root = Path(temporary.name)
         self.auth_source = self.root / 'auth.toml'
         self.repo_source = self.root / 'repository.toml'
+        self.main_source = self.root / 'main.toml'
+        self.main_source.write_text('[METADATA]\nNODE_NAME = "公開図書館"\n[SSG]\nINTERVAL = "10m"\n')
         self.auth_source.write_text('''[METADATA]
 NODE_NAME = "図書館"
 NODE_ADMINS = [{ name = "admin", email = "admin@example.com" }]
@@ -40,9 +42,10 @@ ENABLED = false
 SOURCES_FILE = "/app/connectors/custom.yaml"
 ''')
         example = (prepare.BASE / '.env.example').read_text()
-        example = example.replace('auth.example.com', 'auth.library.test').replace('repository.example.com', 'repository.library.test')
+        example = example.replace('auth.example.com', 'auth.library.test').replace('repository.example.com', 'repository.library.test').replace('library.example.com', 'catalog.library.test')
         example = example.replace('../auth-service/config.example.toml', 'auth.toml')
         example = example.replace('../repository-service/api/config.example.toml', 'repository.toml')
+        example = example.replace('../main-service/api/config.example.toml', 'main.toml')
         (self.root / '.env.example').write_text(example)
         base = patch.object(prepare, 'BASE', self.root)
         base.start()
@@ -104,6 +107,23 @@ SOURCES_FILE = "/app/connectors/custom.yaml"
                 self.assertEqual(client['id'], config['CLIENT_ID'])
                 self.assertEqual(client['audience'], [])
 
+    def test_secrets_from_templates_and_registration_match(self):
+        self.auth_source.write_text('[OAUTH]\nHMAC_SECRET = "template-hmac"\n')
+        self.repo_source.write_text('[OIDC]\nCLIENT_SECRET = "template-client-secret"\n')
+        self.run_prepare()
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], 'template-hmac')
+        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], 'template-client-secret')
+        client_file = self.root / 'runtime/client.json'
+        self.assertEqual(json.loads(client_file.read_text())['secret'], 'template-client-secret')
+        self.assertEqual(client_file.stat().st_mode & 0o777, 0o600)
+
+    def test_generated_secrets_reach_configs_and_client(self):
+        self.run_prepare()
+        env = prepare.read_env((self.root / '.env').read_text())
+        self.assertEqual(self.config('auth')['OAUTH']['HMAC_SECRET'], env['OAUTH_HMAC_SECRET'])
+        self.assertEqual(self.config('repository')['OIDC']['CLIENT_SECRET'], env['REPOSITORY_OIDC_CLIENT_SECRET'])
+        self.assertEqual(json.loads((self.root / 'runtime/client.json').read_text())['secret'], env['REPOSITORY_OIDC_CLIENT_SECRET'])
+
     def test_custom_client_registration(self):
         self.repo_source.write_text('''[OIDC]
 CLIENT_ID = "custom-client"
@@ -144,7 +164,8 @@ AUDIENCE = "https://repository.library.test/api"
     def test_invalid_database_and_domain_settings_are_rejected(self):
         for line in ['AUTH_POSTGRES_DB=repository', 'AUTH_POSTGRES_USER=repository',
                      'AUTH_POSTGRES_USER=postgres', 'AUTH_DOMAIN=auth.example.com',
-                     'AUTH_DOMAIN=repository.library.test', 'AUTH_DOMAIN=-bad.library.test']:
+                     'AUTH_DOMAIN=repository.library.test', 'AUTH_DOMAIN=-bad.library.test',
+                     'MAIN_DOMAIN=library.example.com', 'MAIN_DOMAIN=AUTH.LIBRARY.TEST']:
             with self.subTest(line=line):
                 (self.root / '.env').write_text(line + '\n')
                 with self.assertRaises(ValueError):
@@ -156,6 +177,64 @@ AUDIENCE = "https://repository.library.test/api"
         with self.assertRaises(FileNotFoundError):
             self.run_prepare()
         self.assertFalse((self.root / 'runtime').exists())
+
+    def test_main_has_shared_catalog_credential_and_no_new_database_or_oidc(self):
+        for native in [False, True]:
+            with self.subTest(native=native):
+                original = self.main_source.read_bytes()
+                self.run_prepare(native)
+                main = self.config('main')
+                repo = self.config('repository')
+                self.assertEqual(main['REPOSITORY']['TOKEN'], repo['CATALOG']['TOKEN'])
+                self.assertGreaterEqual(len(main['REPOSITORY']['TOKEN']), 32)
+                self.assertEqual(main['REPOSITORY']['BASE_URL'],
+                                 'http://localhost:8081' if native else 'http://repository:8081')
+                self.assertEqual(main['WEB']['PUBLIC_ORIGIN'],
+                                 'http://localhost:8082' if native else 'https://catalog.library.test')
+                self.assertEqual(main['SSG']['GATEWAY_MANAGED'], not native)
+                self.assertEqual(main['SSG']['INTERVAL'], '10m')
+                self.assertEqual(main['METADATA']['NODE_NAME'], '公開図書館')
+                self.assertNotIn('DATABASE', main)
+                self.assertNotIn('OIDC', main)
+                self.assertEqual(self.main_source.read_bytes(), original)
+                self.assertEqual((self.root / 'runtime/main/config.toml').stat().st_mode & 0o777,
+                                 0o600 if native else 0o644)
+
+    def test_catalog_template_credential_is_preserved_and_conflicts_fail(self):
+        token = 'existing-catalog-token-with-more-than-32-bytes'
+        self.repo_source.write_text('[CATALOG]\nTOKEN = "' + token + '"\n')
+        self.run_prepare()
+        self.assertEqual(self.config('main')['REPOSITORY']['TOKEN'], token)
+        self.main_source.write_text('[REPOSITORY]\nTOKEN = "conflicting-catalog-token-with-32-bytes"\n')
+        with self.assertRaisesRegex(ValueError, 'must match'):
+            self.run_prepare()
+        self.assertEqual(self.config('main')['REPOSITORY']['TOKEN'], token)
+
+    def test_main_repository_origin_can_be_overridden_without_changing_public_origins(self):
+        (self.root / '.env').write_text('MAIN_REPOSITORY_BASE_URL=http://unused:9999\n')
+        with patch.dict(os.environ, {'MAIN_REPOSITORY_BASE_URL': 'http://private-repository:9090/'}):
+            self.run_prepare()
+        main = self.config('main')
+        self.assertEqual(main['REPOSITORY']['BASE_URL'], 'http://private-repository:9090')
+        self.assertEqual(main['WEB']['PUBLIC_ORIGIN'], 'https://catalog.library.test')
+        self.assertEqual(self.config('repository')['OIDC']['ISSUER'], 'https://auth.library.test')
+        self.assertEqual(self.config('repository')['OIDC']['REDIRECT_URI'],
+                         'https://repository.library.test/auth/callback')
+        self.run_prepare(native=True)
+        self.assertEqual(self.config('main')['REPOSITORY']['BASE_URL'], 'http://unused:9999')
+        self.assertEqual(self.config('main')['WEB']['PUBLIC_ORIGIN'], 'http://localhost:8082')
+
+    def test_invalid_main_repository_origins_fail_before_writing_runtime(self):
+        for value in ['file:///tmp/private', 'http://user:secret@repository:8081',
+                      'https://repository.test/path', 'http://repository:8081?x=1',
+                      'http://repository:8081#fragment', 'http://repository:8081?',
+                      'http://repository:8081#', 'http://repository:99999',
+                      'http://repository:0', 'http://bad host:8081']:
+            with self.subTest(value=value):
+                (self.root / '.env').write_text("MAIN_REPOSITORY_BASE_URL='" + value + "'\n")
+                with self.assertRaisesRegex(ValueError, 'MAIN_REPOSITORY_BASE_URL'):
+                    self.run_prepare()
+                self.assertFalse((self.root / 'runtime').exists())
 
     def test_toml_roundtrip_keeps_nested_and_root_settings(self):
         config = {'PORT': ':8080', 'custom section': {'nested': {'quoted.key': ['図書館', True, 42, 1.5]},

@@ -10,7 +10,7 @@ import secrets
 import shlex
 import subprocess
 import tomllib
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 BASE = Path(__file__).resolve().parent
 
@@ -45,7 +45,7 @@ def load_env():
     values = read_env(example) | read_env(text)
     additions = {}
     for name in ['POSTGRES_PASSWORD', 'AUTH_POSTGRES_PASSWORD', 'REPOSITORY_POSTGRES_PASSWORD',
-                 'OAUTH_HMAC_SECRET', 'REPOSITORY_OIDC_CLIENT_SECRET']:
+                 'OAUTH_HMAC_SECRET', 'REPOSITORY_OIDC_CLIENT_SECRET', 'CATALOG_API_TOKEN']:
         if not os.environ.get(name, values.get(name)):
             additions[name] = secrets.token_urlsafe(32)
     # Keep comments, quoted secrets and existing values intact on subsequent runs.
@@ -102,21 +102,38 @@ def load_template(path):
 
 
 def validate_env(env):
-    for name in ['AUTH_DOMAIN', 'REPOSITORY_DOMAIN']:
+    for name in ['AUTH_DOMAIN', 'REPOSITORY_DOMAIN', 'MAIN_DOMAIN']:
         domain = env[name]
         if (not re.fullmatch(r'(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?', domain)
                 or any(not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label)
                        for label in domain.split('.'))
                 or domain == 'example.com' or domain.endswith('.example.com')):
-            raise ValueError('Set AUTH_DOMAIN and REPOSITORY_DOMAIN in _deploy/.env to your HTTPS hostnames')
-    if env['AUTH_DOMAIN'].lower() == env['REPOSITORY_DOMAIN'].lower():
-        raise ValueError('AUTH_DOMAIN and REPOSITORY_DOMAIN must be different hostnames')
+            raise ValueError('Set AUTH_DOMAIN, REPOSITORY_DOMAIN and MAIN_DOMAIN in _deploy/.env to your HTTPS hostnames')
+    if len({env[name].lower() for name in ['AUTH_DOMAIN', 'REPOSITORY_DOMAIN', 'MAIN_DOMAIN']}) != 3:
+        raise ValueError('AUTH_DOMAIN, REPOSITORY_DOMAIN and MAIN_DOMAIN must be different hostnames')
     for name in ['AUTH_POSTGRES_DB', 'REPOSITORY_POSTGRES_DB', 'AUTH_POSTGRES_USER', 'REPOSITORY_POSTGRES_USER']:
         if not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', env[name]) or env[name] in ['postgres', 'template0', 'template1']:
             raise ValueError(f'{name} must be a non-reserved lowercase PostgreSQL identifier (1 to 63 characters)')
     for suffix in ['DB', 'USER']:
         if env[f'AUTH_POSTGRES_{suffix}'] == env[f'REPOSITORY_POSTGRES_{suffix}']:
             raise ValueError(f'AUTH_POSTGRES_{suffix} and REPOSITORY_POSTGRES_{suffix} must be different')
+
+
+def repository_base_url(env, native):
+    value = env.get('MAIN_REPOSITORY_BASE_URL') or (
+        'http://localhost:8081' if native else 'http://repository:8081')
+    try:
+        parsed = urlsplit(value)
+        valid = (parsed.scheme in ['http', 'https'] and parsed.hostname
+                 and parsed.username is None and parsed.password is None
+                 and parsed.path in ['', '/'] and not parsed.query and not parsed.fragment
+                 and not any(c.isspace() for c in value) and '?' not in value and '#' not in value
+                 and (parsed.port is None or 1 <= parsed.port <= 65535))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError('MAIN_REPOSITORY_BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment')
+    return value.rstrip('/')
 
 
 def main():
@@ -130,10 +147,24 @@ def main():
     configs = {
         'auth': load_template(env['AUTH_CONFIG_TEMPLATE']),
         'repository': load_template(env['REPOSITORY_CONFIG_TEMPLATE']),
+        'main': load_template(env['MAIN_CONFIG_TEMPLATE']),
     }
+    if ('CLIENT_SECRET_ENV' in configs['repository'].get('OIDC', {})
+            or 'SECRET_ENV' in configs['repository'].get('API_AUTH', {})):
+        raise ValueError('Replace CLIENT_SECRET_ENV and SECRET_ENV with secret values in the template TOML')
+    repo_token = configs['repository'].get('CATALOG', {}).get('TOKEN')
+    main_token = configs['main'].get('REPOSITORY', {}).get('TOKEN')
+    if repo_token and main_token and repo_token != main_token:
+        raise ValueError('Repository CATALOG.TOKEN and main REPOSITORY.TOKEN must match')
+    catalog_token = repo_token or main_token or env['CATALOG_API_TOKEN']
+    if not isinstance(catalog_token, str) or not (32 <= len(catalog_token.encode()) <= 256) or any(c.isspace() for c in catalog_token):
+        raise ValueError('Catalog TOKEN must contain 32 to 256 bytes without whitespace')
+    configs['repository'].setdefault('CATALOG', {})['TOKEN'] = catalog_token
+    main_repository_url = repository_base_url(env, args.native)
     runtime = (BASE / 'runtime').resolve()
     auth_origin = 'http://localhost:8080' if args.native else 'https://' + env['AUTH_DOMAIN']
     repo_origin = 'http://localhost:8081' if args.native else 'https://' + env['REPOSITORY_DOMAIN']
+    main_origin = 'http://localhost:8082' if args.native else 'https://' + env['MAIN_DOMAIN']
     runtime.mkdir(exist_ok=True)
     key = runtime / 'keys' / 'oidc-signing.pem'
     if args.native:
@@ -142,12 +173,25 @@ def main():
             subprocess.run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:3072', '-out', str(key)],
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             key.chmod(0o600)
-    for name, port, origin in [('auth',8080,auth_origin), ('repository',8081,repo_origin)]:
+    for name, port, origin in [('auth',8080,auth_origin), ('repository',8081,repo_origin), ('main',8082,main_origin)]:
         config = configs[name]
         folder = runtime / name
         folder.mkdir(exist_ok=True)
         hostname = origin.split('://')[1].split(':')[0]
         config.setdefault('HOST', {}).update(SCHEME=origin.split(':')[0] + '://', HOSTNAME=hostname, PORT=f':{port}')
+        if name == 'main':
+            config.setdefault('WEB', {})['PUBLIC_ORIGIN'] = main_origin
+            config.setdefault('REPOSITORY', {}).update(
+                BASE_URL=main_repository_url,
+                TOKEN=catalog_token)
+            config.setdefault('SSG', {}).update(
+                OUTPUT_DIR=str(folder / 'generated') if args.native else '/srv/main',
+                GATEWAY_MANAGED=not args.native)
+            config['SSG'].setdefault('INTERVAL', '5m')
+            target = folder / 'config.toml'
+            target.write_text(render_config(config))
+            target.chmod(0o600 if args.native else 0o644)
+            continue
         webauthn = config.setdefault('WEBAUTHN', {})
         webauthn.setdefault('RP_DISPLAY_NAME', 'Sharelib')
         webauthn['RP_ORIGIN'] = origin
@@ -167,10 +211,13 @@ def main():
             oauth.update(ENABLED=True, ISSUER=auth_origin,
                          SIGNING_KEY_FILE=str(key) if args.native else '/app/keys/oidc-signing.pem')
             oauth.setdefault('SIGNING_KEY_ID', 'sharelib-1')
+            if not oauth.get('HMAC_SECRET'):
+                oauth['HMAC_SECRET'] = env['OAUTH_HMAC_SECRET']
         else:
             oidc = config.setdefault('OIDC', {})
-            oidc.update(ENABLED=True, ISSUER=auth_origin, REDIRECT_URI=repo_origin + '/auth/callback',
-                        CLIENT_SECRET_ENV='REPOSITORY_OIDC_CLIENT_SECRET')
+            oidc.update(ENABLED=True, ISSUER=auth_origin, REDIRECT_URI=repo_origin + '/auth/callback')
+            if not oidc.get('CLIENT_SECRET'):
+                oidc['CLIENT_SECRET'] = env['REPOSITORY_OIDC_CLIENT_SECRET']
             oidc.setdefault('CLIENT_ID', 'repository-service')
             oidc.setdefault('SCOPES', ['openid', 'profile', 'email', 'offline_access'])
         target = folder / 'config.toml'
@@ -181,9 +228,12 @@ def main():
     client = {'id': oidc['CLIENT_ID'], 'name': 'Sharelib repository', 'public': False,
               'redirect_uris': [oidc['REDIRECT_URI']],
               'grant_types': ['authorization_code'] + (['refresh_token'] if 'offline_access' in oidc['SCOPES'] else []),
-              'scopes': oidc['SCOPES'], 'audience': [audience] if audience else []}
-    (runtime / 'client.json').write_text(json.dumps(client,ensure_ascii=False) + '\n')
-    print('Created runtime/auth/config.toml, runtime/repository/config.toml and runtime/client.json; existing config.toml files are unchanged.')
+              'scopes': oidc['SCOPES'], 'audience': [audience] if audience else [],
+              'secret': oidc['CLIENT_SECRET']}
+    client_file = runtime / 'client.json'
+    client_file.write_text(json.dumps(client, ensure_ascii=False) + '\n')
+    client_file.chmod(0o600)
+    print('Created runtime/{auth,repository,main}/config.toml, runtime/client.json; existing config.toml files are unchanged.')
 
 if __name__ == '__main__':
     try:

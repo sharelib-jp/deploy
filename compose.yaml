@@ -7,7 +7,7 @@ x-auth-image: &auth-image
 
 services:
   postgres:
-    image: postgres:17-bookworm
+    image: docker.io/library/postgres:17-bookworm
     networks: [database]
     environment:
       POSTGRES_DB: postgres
@@ -129,7 +129,6 @@ services:
       AUTH_DOMAIN: ${AUTH_DOMAIN:?Set AUTH_DOMAIN in .env}
       REPOSITORY_DOMAIN: ${REPOSITORY_DOMAIN:?Set REPOSITORY_DOMAIN in .env}
       MAIN_DOMAIN: ${MAIN_DOMAIN:?Set MAIN_DOMAIN in .env}
-    ports: ['80:80', '443:443']
     volumes:
       - type: bind
         source: ./Caddyfile
@@ -140,12 +139,8 @@ services:
       - main_catalog:/srv/main
       - caddy_data:/data
       - caddy_config:/config
-    networks:
-      app:
-        aliases:
-          - ${AUTH_DOMAIN}
-          - ${REPOSITORY_DOMAIN}
-          - ${MAIN_DOMAIN}
+    # Public HTTPS names resolve through Cloudflare, including repository -> auth.
+    networks: [app]
     depends_on:
       auth: {condition: service_healthy}
       repository: {condition: service_healthy}
@@ -153,7 +148,7 @@ services:
     restart: unless-stopped
 
   cloudflared:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    image: ${CLOUDFLARED_IMAGE:-docker.io/cloudflare/cloudflared:latest}
     profiles: [tunnel]
     command: [tunnel, --no-autoupdate, run]
     environment:
@@ -164,7 +159,7 @@ services:
     restart: unless-stopped
 
   pgadmin:
-    image: ${PGADMIN_IMAGE:-dpage/pgadmin4:9.19}
+    image: ${PGADMIN_IMAGE:-docker.io/dpage/pgadmin4:9.19}
     profiles: [admin]
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}

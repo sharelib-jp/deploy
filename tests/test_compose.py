@@ -52,8 +52,11 @@ class ComposeTest(unittest.TestCase):
             self.assertEqual(set(config['services'][name]['networks']), {'app', 'database'})
         for name in ['main', 'gateway', 'cloudflared']:
             self.assertEqual(set(config['services'][name]['networks']), {'app'})
-        aliases = config['services']['gateway']['networks']['app']['aliases']
-        self.assertEqual(set(aliases), {'auth.library.test', 'repository.library.test', 'catalog.library.test'})
+        gateway = config['services']['gateway']
+        self.assertFalse(gateway.get('ports'))
+        network = gateway['networks']['app'] or {}
+        self.assertTrue(set(network.get('aliases', [])).isdisjoint({
+            'auth.library.test', 'repository.library.test', 'catalog.library.test'}))
 
     def test_pgadmin_login_persistence_and_local_binding(self):
         config = self.config('admin')

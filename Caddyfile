@@ -1,17 +1,17 @@
-{$AUTH_DOMAIN} {
-    reverse_proxy auth:8080
+http://{$AUTH_DOMAIN} {
+	reverse_proxy auth:8080
 }
 
-{$REPOSITORY_DOMAIN} {
-    @internal path /internal /internal/*
-    respond @internal 404
-    reverse_proxy repository:8081
+http://{$REPOSITORY_DOMAIN} {
+	@internal path /internal /internal/*
+	respond @internal 404
+	reverse_proxy repository:8081
 }
 
-{$MAIN_DOMAIN} {
-    header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-    route {
-        import /srv/main/control/active.caddy
-        reverse_proxy main:8082
-    }
+http://{$MAIN_DOMAIN} {
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+	route {
+		import /srv/main/control/active.caddy
+		reverse_proxy main:8082
+	}
 }
